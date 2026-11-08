@@ -3,8 +3,10 @@ import Foundation
 import ImageIO
 import RetouchCore
 
-// Engine checks on a real photo. Usage: retouch-check <file.CR3> <output dir>
-// Every check prints PASS/FAIL; image outputs are written for visual inspection.
+// Engine checks on a real photo. Usage: retouch-check <image> <output dir>
+// A raw file goes through the develop checks; JPG, PNG, HEIC and TIFF skip them. Every check
+// prints PASS/FAIL; image outputs are written for visual inspection. Positions are fractions of
+// the image, so any photo of at least 400x300 works (timings mean more on a big one).
 
 let args = CommandLine.arguments
 guard args.count >= 3 else {
@@ -40,30 +42,51 @@ var failures = 0
                            options: .init(format: fmt, quality: 0.92, width: w, height: h))
 }
 
-// 1. RAW develop
-check(ImageFiles.isRaw(input), "CR3 recognised as RAW")
-let info = try ImageFiles.rawInfo(input)
-print("  native \(info.width)x\(info.height), lens correction supported: \(info.lensCorrectionSupported)")
-let photo = try timed("full-res develop (standard)") {
-    try ImageFiles.developRaw(input, settings: RawSettings(look: .standard, lensCorrection: true))
-}
-check(photo.width == info.width && photo.height == info.height, "full-res develop is \(photo.width)x\(photo.height)")
-check(!photo.hasTransparency, "developed RAW is opaque")
-for look in RawLook.allCases {
-    let p = try timed("preview develop \(look.rawValue) @1600") {
-        try ImageFiles.developRaw(input, settings: RawSettings(look: look), maxDimension: 1600)
+// 1. Open: raw develop, or a plain raster load
+let isRaw = ImageFiles.isRaw(input)
+let photo: PixelBuffer
+if isRaw {
+    let info = try ImageFiles.rawInfo(input)
+    print("  raw \(info.width)x\(info.height), lens correction supported: \(info.lensCorrectionSupported)")
+    photo = try timed("full-res develop (standard)") {
+        try ImageFiles.developRaw(input, settings: RawSettings(look: .standard, lensCorrection: true))
     }
-    save(p, "look-\(look.rawValue).jpg")
+    check(photo.width == info.width && photo.height == info.height, "full-res develop is \(photo.width)x\(photo.height)")
+    check(!photo.hasTransparency, "developed raw is opaque")
+    for look in RawLook.allCases {
+        let p = try timed("preview develop \(look.rawValue) @1600") {
+            try ImageFiles.developRaw(input, settings: RawSettings(look: look), maxDimension: 1600)
+        }
+        save(p, "look-\(look.rawValue).jpg")
+    }
+} else {
+    photo = try timed("open \(input.lastPathComponent)") { try ImageFiles.loadRaster(input) }
+    check(photo.width > 0 && photo.height > 0, "opened \(photo.width)x\(photo.height)")
+}
+let W = photo.width, H = photo.height
+guard W >= 400, H >= 300 else {
+    print("image is \(W)x\(H); the checks need at least 400x300")
+    exit(2)
+}
+let cx = Double(W) / 2, cy = Double(H) / 2
+
+/// Pixel position at a fraction of the width or height.
+@MainActor func fx(_ f: Double) -> Int { Int(Double(W) * f) }
+@MainActor func fy(_ f: Double) -> Int { Int(Double(H) * f) }
+/// A rect of up to `w` x `h` pixels with its top-left at the given fractions, kept inside the image.
+@MainActor func rectAt(_ x: Double, _ y: Double, w: Int, h: Int) -> IRect {
+    IRect(x: fx(x), y: fy(y), w: min(w, W - fx(x)), h: min(h, H - fy(y)))
 }
 
 // 2. Buffer <-> Core Image round trip keeps orientation and values
 do {
-    let crop = photo.cropped(IRect(x: 1000, y: 700, w: 300, h: 200))
+    let r = rectAt(0.12, 0.13, w: 300, h: 200)
+    let crop = photo.cropped(r)
     let back = PixelBuffer.render(crop.ciImage(), width: crop.width, height: crop.height, context: ctx)
     var maxDiff = 0
     for i in 0..<crop.pixels.count { maxDiff = max(maxDiff, abs(Int(crop.pixels[i]) - Int(back.pixels[i]))) }
     check(maxDiff <= 1, "CIImage round trip max channel diff \(maxDiff) (<=1)")
-    var region = photo.renderRegion(photo.ciImage(), rect: IRect(x: 1000, y: 700, w: 300, h: 200), context: ctx)
+    var region = photo.renderRegion(photo.ciImage(), rect: r, context: ctx)
     var regDiff = 0
     for i in 0..<region.count { regDiff = max(regDiff, abs(Int(region[i]) - Int(crop.pixels[i]))) }
     check(regDiff <= 1, "renderRegion lands on the same top-left rect (diff \(regDiff))")
@@ -71,7 +94,7 @@ do {
 }
 
 // 3. Healing: paint fake defects onto real texture, heal, measure how close the fill is to the original
-@MainActor func healTest(name: String, rect: IRect, stroke: [ImagePoint], diameter: Double) {
+@MainActor func healTest(name: String, stroke: [ImagePoint], diameter: Double) {
     var b = photo
     guard let mask = HealMask.stroke(points: stroke, diameter: diameter, imageBounds: b.bounds) else {
         check(false, "\(name): mask"); return
@@ -113,21 +136,20 @@ do {
     save(truth, "heal-\(name)-truth.png")
 }
 
-let cx = Double(photo.width) / 2, cy = Double(photo.height) / 2
-// spot on the dial near the center
-healTest(name: "spot", rect: IRect(x: 0, y: 0, w: 0, h: 0),
-         stroke: [ImagePoint(x: cx + 700, y: cy - 900)], diameter: 40)
-// scratch across the case/strap region
-healTest(name: "scratch", rect: IRect(x: 0, y: 0, w: 0, h: 0),
-         stroke: (0...20).map { ImagePoint(x: cx - 2200 + Double($0) * 25, y: cy + 1200 + Double($0) * 6) },
-         diameter: 24)
-// stroke across the left subdial's outer ring: the ring line should continue through the fill
-healTest(name: "ring", rect: IRect(x: 0, y: 0, w: 0, h: 0),
-         stroke: [ImagePoint(x: 2290, y: 2620), ImagePoint(x: 2460, y: 2620)], diameter: 30)
-// larger blob on the background fabric
-healTest(name: "blob", rect: IRect(x: 0, y: 0, w: 0, h: 0),
-         stroke: (0...10).map { ImagePoint(x: 600 + Double($0) * 20, y: 600 + Double($0) * 12) },
-         diameter: 120)
+let unit = Double(W) / 8192 // brush sizes scale with the image; the reference sizes are for a 45 MP frame
+// a spot above and right of the center
+healTest(name: "spot", stroke: [ImagePoint(x: cx + 0.085 * Double(W), y: cy - 0.165 * Double(H))], diameter: max(6, 40 * unit))
+// a long shallow diagonal scratch, lower left
+healTest(name: "scratch",
+         stroke: (0...20).map { ImagePoint(x: cx - 0.27 * Double(W) + Double($0) * 25 * unit, y: cy + 0.22 * Double(H) + Double($0) * 6 * unit) },
+         diameter: max(5, 24 * unit))
+// a short horizontal stroke: edges that cross it should continue through the fill
+healTest(name: "line", stroke: [ImagePoint(x: 0.28 * Double(W), y: 0.48 * Double(H)), ImagePoint(x: 0.30 * Double(W), y: 0.48 * Double(H))],
+         diameter: max(6, 30 * unit))
+// a large blob near the top-left corner
+healTest(name: "blob",
+         stroke: (0...10).map { ImagePoint(x: 0.073 * Double(W) + Double($0) * 20 * unit, y: 0.11 * Double(H) + Double($0) * 12 * unit) },
+         diameter: max(12, 120 * unit))
 
 // 4. Magic eraser on a synthetic image: gray background, dark disc
 do {
@@ -146,10 +168,10 @@ do {
     let expected = 400 * 300 - Int(Double.pi * 80 * 80)
     check(abs(res.erasedCount - expected) < 400, "magic eraser: erased \(res.erasedCount) px (expected ~\(expected))")
     save(s, "magic-eraser-synthetic.png")
-    // Non-contiguous on the real photo, click the background fabric
-    var p = photo.cropped(IRect(x: 0, y: 0, w: 2000, h: 1400))
-    if let r2 = timed("magic eraser contiguous on 2000x1400 photo crop", {
-        MagicEraser.erase(p, x: 300, y: 300, tolerance: 32, contiguous: true, antiAlias: true)
+    // Contiguous on the real photo, clicking near its top-left corner
+    var p = photo.cropped(IRect(x: 0, y: 0, w: min(2000, W), h: min(1400, H)))
+    if let r2 = timed("magic eraser contiguous on \(p.width)x\(p.height) photo crop", {
+        MagicEraser.erase(p, x: p.width * 3 / 20, y: p.height * 3 / 14, tolerance: 32, contiguous: true, antiAlias: true)
     }) {
         p.writeRegion(r2.rect, r2.pixels)
         print("  erased \(r2.erasedCount) px on photo crop")
@@ -158,7 +180,8 @@ do {
 }
 
 // 5. Filters inside a selection: outside untouched, alpha stays opaque
-let sel = IRect(x: Int(cx) - 600, y: Int(cy) - 400, w: 1200, h: 800)
+let selW = min(1200, W / 2), selH = min(800, H / 2)
+let sel = IRect(x: Int(cx) - selW / 2, y: Int(cy) - selH / 2, w: selW, h: selH)
 let ops: [FilterOp] = [
     .unsharpMask(amount: 150, radius: 2, threshold: 0),
     .unsharpMask(amount: 150, radius: 2, threshold: 8),
@@ -167,7 +190,7 @@ let ops: [FilterOp] = [
     .hueSaturation(hue: 0, saturation: 0, lightness: 40),
 ]
 for op in ops {
-    let bytes = timed("\(op) on 1200x800 selection") { Filters.apply(op, to: photo, rect: sel) }
+    let bytes = timed("\(op) on \(sel.w)x\(sel.h) selection") { Filters.apply(op, to: photo, rect: sel) }
     var opaque = true
     var changed = 0
     let orig = photo.copyRegion(sel)
@@ -183,13 +206,19 @@ for op in ops {
     save(shown.cropped(sel.expanded(by: 100).intersection(photo.bounds)), "filter-\(name).jpg", maxSide: 1400)
 }
 // full-image unsharp timing (no selection)
-_ = timed("unsharp mask, whole 45 MP image") {
+_ = timed("unsharp mask, whole \(W)x\(H) image") {
     Filters.apply(.unsharpMask(amount: 100, radius: 1.5, threshold: 0), to: photo, rect: photo.bounds)
 }
 
 // 6. Auto Tone / Contrast / Color
-var flat = try ImageFiles.developRaw(input, settings: RawSettings(look: .flat), maxDimension: 1600)
-save(flat, "auto-0-input-flat.jpg")
+var flat: PixelBuffer
+if isRaw {
+    flat = try ImageFiles.developRaw(input, settings: RawSettings(look: .flat), maxDimension: 1600)
+} else {
+    let s = min(1.0, 1600 / Double(max(W, H)))
+    flat = Transforms.resize(photo, width: max(1, Int(Double(W) * s)), height: max(1, Int(Double(H) * s)))
+}
+save(flat, "auto-0-input.jpg")
 for k in AutoAdjust.allCases {
     let bytes = timed(k.historyName) { k.apply(to: flat, rect: flat.bounds) }
     var b = flat
@@ -202,10 +231,10 @@ for k in AutoAdjust.allCases {
     }
     check(hi - lo > 200, "\(k.historyName): tonal range \(lo)...\(hi)")
 }
-// The flat develop already reaches 0 and 255 (black fabric, specular highlights), so squeeze a copy
-// into 70...180 and confirm each auto command stretches it back out.
+// A photo may already reach 0 and 255, so squeeze a central crop into 70...180 and confirm each
+// auto command stretches it back out.
 do {
-    var squeezed = photo.cropped(IRect(x: Int(cx) - 1200, y: Int(cy) - 800, w: 2400, h: 1600))
+    var squeezed = photo.cropped(IRect(x: Int(cx) - fx(0.15), y: Int(cy) - fy(0.15), w: fx(0.3), h: fy(0.3)))
     for i in 0..<squeezed.pixels.count where i % 4 != 3 {
         squeezed.pixels[i] = UInt8(70 + Int(squeezed.pixels[i]) * 110 / 255)
     }
@@ -223,27 +252,28 @@ do {
         save(b, "auto-1-squeezed-\(k.rawValue).jpg", maxSide: 1200)
     }
 }
-_ = timed("Auto Tone, whole 45 MP image") { AutoAdjust.tone.apply(to: photo, rect: photo.bounds) }
+_ = timed("Auto Tone, whole \(W)x\(H) image") { AutoAdjust.tone.apply(to: photo, rect: photo.bounds) }
 flat.pixels.removeAll()
 
 // 7. Geometry
-let small = photo.cropped(IRect(x: 0, y: 0, w: 1600, h: 1000))
+let small = photo.cropped(IRect(x: 0, y: 0, w: min(1600, W), h: min(1000, H)))
 let cw = small.rotated90(clockwise: true)
-check(cw.width == 1000 && cw.height == 1600, "rotate 90 CW dims")
+check(cw.width == small.height && cw.height == small.width, "rotate 90 CW dims")
 // top-left pixel of the original must land at top-right after a clockwise turn
 let tl = Array(small.pixels[0..<4]), trIdx = (0 * cw.width + cw.width - 1) * 4
 check(Array(cw.pixels[trIdx..<trIdx + 4]) == tl, "rotate 90 CW moves top-left to top-right")
 check(cw.rotated90(clockwise: false).pixels == small.pixels, "rotate CW then CCW is identity")
 check(small.rotated180().rotated180().pixels == small.pixels, "rotate 180 twice is identity")
-let arb = timed("arbitrary rotate 5 deg (1600x1000)") { Transforms.rotate(small, degrees: 5) }
+let arb = timed("arbitrary rotate 5 deg (\(small.width)x\(small.height))") { Transforms.rotate(small, degrees: 5) }
 check(arb.width > small.width && arb.height > small.height, "arbitrary rotate grows canvas to \(arb.width)x\(arb.height)")
 check(arb.pixels[3] == 0, "arbitrary rotate: new corner is transparent")
 save(arb, "rotate-5deg.png", maxSide: 1200)
-let resized = timed("resize 8192 -> 1600 wide") { Transforms.resize(photo, width: 1600, height: 1067) }
-check(resized.width == 1600 && resized.height == 1067 && !resized.hasTransparency, "resize to exactly 1600x1067, opaque")
-save(resized, "resize-1600.jpg")
-let up = Transforms.resize(small, width: 3200, height: 2000)
-check(up.width == 3200 && up.height == 2000, "upscale to 3200x2000")
+let rw = min(1600, W), rh = max(1, Int((Double(rw) * Double(H) / Double(W)).rounded()))
+let resized = timed("resize \(W) -> \(rw) wide") { Transforms.resize(photo, width: rw, height: rh) }
+check(resized.width == rw && resized.height == rh && !resized.hasTransparency, "resize to exactly \(rw)x\(rh), opaque")
+save(resized, "resize-\(rw).jpg")
+let up = Transforms.resize(small, width: small.width * 2, height: small.height * 2)
+check(up.width == small.width * 2 && up.height == small.height * 2, "upscale to \(up.width)x\(up.height)")
 
 // 8. Export: JPG full size, PNG with transparency, sRGB conversion
 do {

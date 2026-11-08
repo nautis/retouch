@@ -56,7 +56,7 @@ struct EmptyEditorView: View {
                 Text("Drop photos here, or open them with ⌘O")
                     .font(.title3)
                     .foregroundStyle(.white.opacity(0.8))
-                Text("CR3, JPG, PNG, HEIC and TIFF. Each image opens in its own tab.")
+                Text("Raw, JPG, PNG, HEIC and TIFF. Each image opens in its own tab.")
                     .foregroundStyle(.white.opacity(0.5))
                 Button("Open…", action: onOpen)
                     .buttonStyle(.borderedProminent)

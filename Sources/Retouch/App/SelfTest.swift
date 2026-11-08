@@ -1,10 +1,12 @@
 import AppKit
 import RetouchCore
 
-/// End-to-end check of the real app: `Retouch --selftest <outdir> <file.CR3>`.
-/// Opens the file, develops it, drives the canvas with synthetic mouse events (heal, select,
-/// magic eraser), applies filters, undoes, crops, rotates and exports, writing a window snapshot
-/// after each step and a PASS/FAIL log to <outdir>/selftest.txt. Does nothing without the flag.
+/// End-to-end check of the real app: `Retouch --selftest <outdir> <image>`.
+/// Opens the file (a raw file goes through the Camera Raw step first), drives the canvas with
+/// synthetic mouse and key events (heal, select, magic eraser, dialogs), applies filters, undoes,
+/// crops, rotates and exports, writing a window snapshot after each step and a PASS/FAIL log to
+/// <outdir>/selftest.txt. Coordinates are fractions of the image, so any photo works.
+/// Does nothing without the flag.
 @MainActor
 enum SelfTest {
     private static var log: [String] = []
@@ -33,14 +35,18 @@ enum SelfTest {
     }
 
     private static func wait(_ what: String, timeout: Double = 30, _ condition: () -> Bool) async {
+        if await !settles(within: timeout, condition) { check(false, "timed out waiting for \(what)") }
+    }
+
+    /// Polls until `condition` holds; false on timeout. Use directly for states too brief to be
+    /// guaranteed observable (a preview that renders in a few milliseconds on a small image).
+    private static func settles(within timeout: Double, _ condition: () -> Bool) async -> Bool {
         let start = Date.now
         while !condition() {
-            if Date.now.timeIntervalSince(start) > timeout {
-                check(false, "timed out waiting for \(what)")
-                return
-            }
+            if Date.now.timeIntervalSince(start) > timeout { return false }
             try? await Task.sleep(for: .milliseconds(50))
         }
+        return true
     }
 
     private static func finish() -> Never {
@@ -72,7 +78,7 @@ enum SelfTest {
         check(capture.terminationStatus == 0 && FileManager.default.fileExists(atPath: url.path), "snapshot \(name).png")
     }
 
-    // MARK: - Synthetic mouse
+    // MARK: - Synthetic input
 
     private static func mouse(_ type: NSEvent.EventType, _ p: CGPoint, _ window: NSWindow) -> NSEvent? {
         NSEvent.mouseEvent(with: type, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
@@ -108,36 +114,46 @@ enum SelfTest {
         let m = controller.model
         window.setContentSize(NSSize(width: 1400, height: 900))
 
-        await wait("RAW develop preview") { m.mode == .developing && m.displayImage != nil && m.busyMessage == nil }
-        check(m.isRaw && m.mode == .developing, "CR3 opens in the Camera Raw step")
-        await snap(window, "01-develop-standard")
-        m.rawSettings.look = .vivid
-        try? await Task.sleep(for: .milliseconds(150))
-        await wait("vivid preview") { m.busyMessage == nil }
-        await snap(window, "02-develop-vivid")
-        m.rawSettings.look = .standard
-        try? await Task.sleep(for: .milliseconds(150))
-        await wait("standard preview") { m.busyMessage == nil }
+        if ImageFiles.isRaw(file) {
+            await wait("raw develop preview") { m.mode == .developing && m.displayImage != nil && m.busyMessage == nil }
+            check(m.mode == .developing, "raw file opens in the Camera Raw step")
+            await snap(window, "01-develop-standard")
+            m.rawSettings.look = .vivid
+            try? await Task.sleep(for: .milliseconds(150))
+            await wait("vivid preview") { m.busyMessage == nil }
+            await snap(window, "02-develop-vivid")
+            m.rawSettings.look = .standard
+            try? await Task.sleep(for: .milliseconds(150))
+            await wait("standard preview") { m.busyMessage == nil }
 
-        // Open Image: look changes while the full develop runs must not start a preview that would
-        // replace the full-resolution image once it lands
-        let finishing = Task { await m.finishDevelop() }
-        await wait("finishing state", timeout: 5) { m.isFinishingDevelop }
-        check(m.isFinishingDevelop, "Open Image enters the finishing state")
-        m.rawSettings.look = .vivid
-        await finishing.value
-        check(!m.isFinishingDevelop && m.mode == .editing, "full develop finished")
-        check(m.busyMessage == nil, "look change during the full develop started no preview")
-        m.rawSettings.look = .standard
+            // Open Image: look changes while the full develop runs must not start a preview that would
+            // replace the full-resolution image once it lands
+            let finishing = Task { await m.finishDevelop() }
+            await wait("finishing state", timeout: 5) { m.isFinishingDevelop }
+            check(m.isFinishingDevelop, "Open Image enters the finishing state")
+            m.rawSettings.look = .vivid
+            await finishing.value
+            check(!m.isFinishingDevelop && m.mode == .editing, "full develop finished")
+            check(m.busyMessage == nil, "look change during the full develop started no preview")
+            m.rawSettings.look = .standard
+            let native = m.rawInfo.map { CGSize(width: $0.width, height: $0.height) }
+            check(native == m.imageSize, "full-res image matches the raw size \(Int(m.imageSize.width))x\(Int(m.imageSize.height))")
+        }
         await wait("editing") { m.mode == .editing && m.displayImage != nil && m.busyMessage == nil }
         try? await Task.sleep(for: .milliseconds(200))
-        check(m.imageSize == CGSize(width: 8192, height: 5464), "full-res image is \(Int(m.imageSize.width))x\(Int(m.imageSize.height))")
+        let w = Int(m.imageSize.width), h = Int(m.imageSize.height)
+        check(w >= 200 && h >= 200, "image is \(w)x\(h) (the test needs at least 200x200)")
         await snap(window, "03-editing")
         guard let canvas = m.canvas else {
             check(false, "canvas exists")
             finish()
         }
-        check(m.zoomPercent > 5 && m.zoomPercent < 30, "fits on screen at \(m.zoomPercent)%")
+        check(m.zoomPercent > 0, "fits on screen at \(m.zoomPercent)%")
+
+        // Positions as fractions of the image, so the same test runs on any photo.
+        func px(_ f: Double) -> Int { Int(Double(w) * f) }
+        func py(_ f: Double) -> Int { Int(Double(h) * f) }
+        func at(_ fx: Double, _ fy: Double) -> ImagePoint { ImagePoint(x: Double(px(fx)), y: Double(py(fy))) }
 
         // Pruned history keeps the window dirty: undoing every retained step is not the original image
         m.history.byteLimit = 1
@@ -150,15 +166,16 @@ enum SelfTest {
 
         // Heal: paint a stroke through synthetic mouse events
         m.tool = .heal
-        m.brushSize = 60
-        let before = m.buffer?.copyRegion(IRect(x: 5100, y: 1700, w: 400, h: 200))
-        drag(canvas, window, from: ImagePoint(x: 5150, y: 1800), to: ImagePoint(x: 5450, y: 1800), steps: 12)
+        m.brushSize = max(8, (Double(w) / 136).rounded())
+        let healRect = IRect(x: px(0.61), y: py(0.30), w: px(0.07), h: py(0.06)).intersection(m.buffer!.bounds)
+        let before = m.buffer?.copyRegion(healRect)
+        drag(canvas, window, from: at(0.629, 0.329), to: at(0.665, 0.329), steps: 12)
         await wait("heal") { m.busyMessage == nil && m.history.undoName == "Spot Healing" }
-        let after = m.buffer?.copyRegion(IRect(x: 5100, y: 1700, w: 400, h: 200))
+        let after = m.buffer?.copyRegion(healRect)
         check(m.history.undoName == "Spot Healing", "mouse stroke recorded as Spot Healing")
         check(before != nil && before != after, "heal changed pixels under the stroke")
         check(m.isDirty, "window marked as edited after heal")
-        canvas.center(on: ImagePoint(x: 5300, y: 1800), percent: 100)
+        canvas.center(on: at(0.647, 0.329), percent: 100)
         try? await Task.sleep(for: .milliseconds(100))
         await snap(window, "04-heal-100pct")
         await m.undo()
@@ -167,34 +184,42 @@ enum SelfTest {
         canvas.zoomToFit()
 
         // A stroke dragged off the bottom-right edge must heal the part inside the image, not crash
-        drag(canvas, window, from: ImagePoint(x: 8000, y: 5300), to: ImagePoint(x: 8600, y: 6000), steps: 10)
+        drag(canvas, window, from: at(0.976, 0.97), to: at(1.05, 1.1), steps: 10)
         await wait("edge heal") { m.busyMessage == nil && m.history.undoStack.count == 2 }
         check(m.history.undoStack.count == 2, "stroke past the image edge is healed (\(m.history.undoStack.count) steps)")
         await m.undo()
 
         // A size-1 brush clicked on a pixel corner covers no pixel center: nothing happens, no crash
         m.brushSize = 1
-        drag(canvas, window, from: ImagePoint(x: 4000, y: 3000), to: ImagePoint(x: 4000, y: 3000), steps: 1)
+        let corner = ImagePoint(x: Double(w / 2), y: Double(h / 2))
+        drag(canvas, window, from: corner, to: corner, steps: 1)
         try? await Task.sleep(for: .milliseconds(300))
         await wait("empty stroke") { m.busyMessage == nil }
         check(m.history.undoStack.count == 1, "a stroke covering no pixel records nothing (\(m.history.undoStack.count) steps)")
-        m.brushSize = 60
+        m.brushSize = max(8, (Double(w) / 136).rounded())
 
         // Rectangle select by dragging
         m.tool = .select
-        drag(canvas, window, from: ImagePoint(x: 2000, y: 1400), to: ImagePoint(x: 5200, y: 3800), steps: 8)
-        check(m.selection == IRect(x: 2000, y: 1400, w: 3200, h: 2400), "drag made selection \(m.selection?.description ?? "nil")")
+        let ax = px(0.244), ay = py(0.256), bx = px(0.635), by = py(0.695)
+        drag(canvas, window, from: at(0.244, 0.256), to: at(0.635, 0.695), steps: 8)
+        check(m.selection == IRect(x: ax, y: ay, w: bx - ax, h: by - ay), "drag made selection \(m.selection?.description ?? "nil")")
         // move the selection outline by dragging inside it
-        drag(canvas, window, from: ImagePoint(x: 3000, y: 2000), to: ImagePoint(x: 3100, y: 2100), steps: 4)
-        check(m.selection?.x == 2100 && m.selection?.y == 1500, "dragging inside moves the selection to \(m.selection?.description ?? "nil")")
+        let shift = max(2, px(0.012))
+        let inside = ImagePoint(x: Double((ax + bx) / 2), y: Double((ay + by) / 2))
+        drag(canvas, window, from: inside, to: ImagePoint(x: inside.x + Double(shift), y: inside.y + Double(shift)), steps: 4)
+        check(m.selection?.x == ax + shift && m.selection?.y == ay + shift,
+              "dragging inside moves the selection to \(m.selection?.description ?? "nil")")
+        let movedSelection = m.selection
         await snap(window, "06-selection")
 
         // A 1:1 selection dragged past the right edge stays square
         m.selectionRatio = .square
-        drag(canvas, window, from: ImagePoint(x: 7800, y: 1000), to: ImagePoint(x: 8192, y: 2000), steps: 4)
-        check(m.selection?.w == 392 && m.selection?.h == 392, "1:1 selection clipped at the edge stays square (\(m.selection?.description ?? "nil"))")
+        let rx = px(0.952)
+        drag(canvas, window, from: at(0.952, 0.183), to: ImagePoint(x: Double(w), y: Double(py(0.366))), steps: 4)
+        check(m.selection?.w == w - rx && m.selection?.h == w - rx,
+              "1:1 selection clipped at the edge stays square (\(m.selection?.description ?? "nil"))")
         m.selectionRatio = .free
-        m.selection = IRect(x: 2100, y: 1500, w: 3200, h: 2400)
+        m.selection = movedSelection
 
         // Unsharp Mask floats over the canvas with a live preview, then cancel
         m.dialog = .unsharpMask
@@ -241,29 +266,32 @@ enum SelfTest {
         m.deselect()
         m.dialog = .unsharpMask
         await wait("Unsharp Mask panel again") { controller.dialogWindow != nil }
-        await wait("preview in flight", timeout: 10) { m.busyMessage != nil }
+        await wait("dialog settings known", timeout: 5) { m.currentFilterOp != nil }
+        _ = await settles(within: 5) { m.busyMessage != nil } // catch it mid-render when the image is big enough
         await m.commitFilter(.unsharpMask(amount: 100, radius: 1, threshold: 0))
         await wait("commit after early OK", timeout: 60) { m.busyMessage == nil && controller.dialogWindow == nil }
         check(m.history.undoName == "Unsharp Mask", "OK during a running preview still applies the filter (\(m.history.undoName ?? "nil"))")
         check(m.canEdit, "window is editable after OK during a running preview")
         await m.undo()
-        m.selection = IRect(x: 2100, y: 1500, w: 3200, h: 2400)
+        m.selection = movedSelection
 
         // Mosaic inside the selection
-        await m.commitFilter(.mosaic(cellSize: 80))
+        await m.commitFilter(.mosaic(cellSize: max(4, px(0.01))))
         check(m.history.undoName == "Mosaic", "Mosaic applied to the selection")
         await snap(window, "08-mosaic")
 
-        // Magic eraser click on the background fabric (top-left corner area)
+        // Magic eraser click near the top-left corner
         m.tool = .magicEraser
         m.deselect()
-        if let down = mouse(.leftMouseDown, canvas.windowPoint(forImage: ImagePoint(x: 300, y: 300)), window),
-           let up = mouse(.leftMouseUp, canvas.windowPoint(forImage: ImagePoint(x: 300, y: 300)), window) {
+        let ex = px(0.037), ey = py(0.055)
+        let eraseAt = ImagePoint(x: Double(ex) + 0.5, y: Double(ey) + 0.5)
+        if let down = mouse(.leftMouseDown, canvas.windowPoint(forImage: eraseAt), window),
+           let up = mouse(.leftMouseUp, canvas.windowPoint(forImage: eraseAt), window) {
             canvas.mouseDown(with: down)
             canvas.mouseUp(with: up)
         }
         await wait("magic eraser") { m.busyMessage == nil && m.history.undoName == "Magic Eraser" }
-        check(m.buffer?.pixels[(300 * 8192 + 300) * 4 + 3] == 0, "clicked pixel is transparent")
+        check(m.buffer?.pixels[(ey * w + ex) * 4 + 3] == 0, "clicked pixel is transparent")
         await snap(window, "09-magic-eraser")
 
         // Auto Tone on the whole image
@@ -276,27 +304,29 @@ enum SelfTest {
         await snap(window, "10-after-undos")
 
         // Crop to a selection, then undo
-        m.selection = IRect(x: 1000, y: 800, w: 6000, h: 4000)
+        let crop = IRect(x: px(0.122), y: py(0.146), w: px(0.73), h: py(0.73))
+        m.selection = crop
         await m.cropToSelection()
-        check(m.imageSize == CGSize(width: 6000, height: 4000), "crop to selection gives 6000x4000")
+        check(m.imageSize == CGSize(width: crop.w, height: crop.h), "crop to selection gives \(crop.w)x\(crop.h)")
         try? await Task.sleep(for: .milliseconds(200))
         await snap(window, "11-cropped")
         await m.undo()
-        check(m.imageSize == CGSize(width: 8192, height: 5464), "undo crop restores 8192x5464")
+        check(m.imageSize == CGSize(width: w, height: h), "undo crop restores \(w)x\(h)")
 
         // Rotate 90 clockwise, then arbitrary 3 degrees
         await m.rotate(degrees: 90)
-        check(m.imageSize == CGSize(width: 5464, height: 8192), "rotate 90 swaps dimensions")
+        check(m.imageSize == CGSize(width: h, height: w), "rotate 90 swaps dimensions")
         try? await Task.sleep(for: .milliseconds(200))
         await snap(window, "12-rotated")
         await m.undo()
         await m.rotate(degrees: 3)
-        check(m.imageSize.width > 8192, "arbitrary rotate grows the canvas")
+        check(Int(m.imageSize.width) > w, "arbitrary rotate grows the canvas")
         await m.undo()
 
         // Image Size
-        await m.resize(width: 1600, height: 1067)
-        check(m.imageSize == CGSize(width: 1600, height: 1067), "resize to 1600x1067")
+        let rw = max(1, w / 5), rh = max(1, h / 5)
+        await m.resize(width: rw, height: rh)
+        check(m.imageSize == CGSize(width: rw, height: rh), "resize to \(rw)x\(rh)")
         await m.undo()
 
         // Export full size JPG, then the window is no longer dirty
@@ -304,7 +334,7 @@ enum SelfTest {
         try? FileManager.default.removeItem(at: url)
         await m.export(to: url, options: m.defaultExportOptions())
         let exported = (try? ImageFiles.loadRaster(url)).map { ($0.width, $0.height) }
-        check(exported.map { $0 == (8192, 5464) } ?? false, "exported JPG is 8192x5464")
+        check(exported.map { $0 == (w, h) } ?? false, "exported JPG is \(w)x\(h)")
         check(!m.isDirty, "export clears the edited state")
         check(window.isDocumentEdited == false, "close button dot cleared")
 

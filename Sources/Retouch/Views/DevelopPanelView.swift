@@ -1,7 +1,7 @@
 import RetouchCore
 import SwiftUI
 
-/// Camera Raw step for CR3 files: choose a look and lens correction, then open at full resolution.
+/// Camera Raw step for raw files: choose a look and lens correction, then open at full resolution.
 struct DevelopPanelView: View {
     @Bindable var model: EditorModel
 
@@ -23,7 +23,7 @@ struct DevelopPanelView: View {
             Toggle("Lens correction", isOn: $model.rawSettings.lensCorrection)
                 .disabled(!(model.rawInfo?.lensCorrectionSupported ?? false) || model.isFinishingDevelop)
                 .help("Fixes distortion using the lens profile Apple's RAW engine has for your lens")
-            Text("The original CR3 is never changed. Your look and lens setting are remembered for the next file.")
+            Text("The original raw file is never changed. Your look and lens setting are remembered for the next file.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
