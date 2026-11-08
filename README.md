@@ -7,6 +7,16 @@ A small native Mac photo editor that covers a handful of everyday fixes and noth
 
 Launching the app opens an empty workspace window. Open one or more images with ⌘O (the panel allows multiple selection), by dropping them on the window, or with Open With in Finder; each image opens in its own tab. Closing the last image brings the empty workspace back.
 
+## Download
+
+Grab `Retouch-<version>.zip` from the [latest release](https://github.com/nautis/retouch/releases/latest), unzip it and drag Retouch.app to Applications. It's a universal binary (Apple silicon and Intel) and needs macOS 26 or later.
+
+The download isn't notarized, so macOS blocks the first launch with a message that it can't verify the app. Open System Settings > Privacy & Security, scroll down to Security and click Open Anyway ([Apple's steps](https://support.apple.com/guide/mac-help/mh40616/mac)). The Terminal alternative is to clear the quarantine flag:
+
+```sh
+xattr -d com.apple.quarantine /Applications/Retouch.app
+```
+
 ## Tools
 
 | Tool | Key | What it does |
@@ -38,6 +48,7 @@ Requires macOS 26 or later and Xcode 27. The script sets `DEVELOPER_DIR` to `/Ap
 ```sh
 scripts/build-app.sh            # builds build/Retouch.app
 scripts/build-app.sh install    # also copies to /Applications and registers it for Open With
+scripts/release.sh 1.0.0        # universal build zipped for a release (see the script for notarizing)
 ```
 
 ## Checks
