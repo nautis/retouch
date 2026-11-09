@@ -9,13 +9,7 @@ Launching the app opens an empty workspace window. Open one or more images with 
 
 ## Download
 
-Grab `Retouch-<version>.zip` from the [latest release](https://github.com/nautis/retouch/releases/latest), unzip it and drag Retouch.app to Applications. It's a universal binary (Apple silicon and Intel) and needs macOS 26 or later.
-
-The download isn't notarized, so macOS blocks the first launch with a message that it can't verify the app. Open System Settings > Privacy & Security, scroll down to Security and click Open Anyway ([Apple's steps](https://support.apple.com/guide/mac-help/mh40616/mac)). The Terminal alternative is to clear the quarantine flag:
-
-```sh
-xattr -d com.apple.quarantine /Applications/Retouch.app
-```
+Grab `Retouch-<version>.zip` from the [latest release](https://github.com/nautis/retouch/releases/latest), unzip it and drag Retouch.app to Applications. It's a universal binary (Apple silicon and Intel) and needs macOS 26 or later. The app is signed with a Developer ID and notarized by Apple.
 
 ## Tools
 
