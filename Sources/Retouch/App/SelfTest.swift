@@ -82,22 +82,45 @@ enum SelfTest {
 
     // MARK: - Synthetic input
 
+    /// `Retouch --ax-press <pid> <button title>`: presses a button in another Retouch's front
+    /// window through accessibility and exits 0/1. Run from a second process because the save
+    /// sheet is a remote view whose contents its own process cannot see, and System Events
+    /// resolves `process "Retouch"` to whichever Retouch the person has open.
+    static func runHelperIfRequested() {
+        let args = ProcessInfo.processInfo.arguments
+        guard let i = args.firstIndex(of: "--ax-press"), args.count > i + 2, let pid = pid_t(args[i + 1]) else { return }
+        let title = args[i + 2]
+        func attr(_ e: AXUIElement, _ name: String) -> AnyObject? {
+            var v: AnyObject?
+            return AXUIElementCopyAttributeValue(e, name as CFString, &v) == .success ? v : nil
+        }
+        func search(_ e: AXUIElement, depth: Int) -> AXUIElement? {
+            if depth > 12 { return nil }
+            if attr(e, kAXRoleAttribute) as? String == kAXButtonRole, attr(e, kAXTitleAttribute) as? String == title { return e }
+            for key in [kAXWindowsAttribute, "AXSheets", kAXChildrenAttribute] {
+                for child in (attr(e, key) as? [AXUIElement]) ?? [] {
+                    if let hit = search(child, depth: depth + 1) { return hit }
+                }
+            }
+            return nil
+        }
+        guard AXIsProcessTrusted() else { print("ax-press: this process is not trusted for accessibility"); exit(2) }
+        guard let button = search(AXUIElementCreateApplication(pid), depth: 0) else { print("ax-press: no button \"\(title)\" in pid \(pid)"); exit(1) }
+        exit(AXUIElementPerformAction(button, kAXPressAction as CFString) == .success ? 0 : 1)
+    }
+
     private static func pressSaveFromOutside() -> Bool {
-        let script = """
-        tell application "System Events" to tell process "Retouch"
-            set s to sheet 1 of window 1
-            click button "Save" of splitter group 1 of s
-        end tell
-        """
+        guard let exe = Bundle.main.executableURL else { return false }
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", script]
-        let err = Pipe()
-        p.standardError = err
-        do { try p.run() } catch { note("osascript: \(error.localizedDescription)"); return false }
+        p.executableURL = exe
+        p.arguments = ["--ax-press", String(getpid()), "Save"]
+        let out = Pipe()
+        p.standardOutput = out
+        do { try p.run() } catch { note("ax-press: \(error.localizedDescription)"); return false }
         p.waitUntilExit()
-        let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        if p.terminationStatus != 0 { note("osascript exit \(p.terminationStatus): \(msg)") }
+        if p.terminationStatus != 0 {
+            note(String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "ax-press failed")
+        }
         return p.terminationStatus == 0
     }
 
@@ -400,8 +423,8 @@ enum SelfTest {
             // NSRemoteView from the open-and-save service, and a synthetic Return goes nowhere while
             // the app is not active. The accessibility tree bridges the remote view, so press Save there.
             // the remote view's contents are not bridged for the process itself (the sheet shows one
-            // roleless child), so System Events presses it from outside.
-            check(pressSaveFromOutside(), "System Events pressed Save in the save sheet")
+            // roleless child), so a second Retouch process presses it through accessibility.
+            check(pressSaveFromOutside(), "Save pressed in the save sheet from outside")
         }
         await wait("save sheet export", timeout: 30) { m.busyMessage == nil && window.attachedSheet == nil }
         try? await Task.sleep(for: .milliseconds(300))
