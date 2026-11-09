@@ -403,8 +403,22 @@ final class EditorModel {
     }
 
     /// Asks where to save, then writes the file.
+    ///
+    /// The Export As sheet's own button calls this, and that sheet is still attached while it
+    /// animates closed. A save panel begun as a sheet at that moment is queued behind it and then
+    /// dropped when it ends: no panel, no file, no error. So wait for the window to be sheet-free.
     func chooseDestinationAndExport(_ options: ExportOptions) {
         guard let window else { return }
+        Task { @MainActor [weak self] in
+            let start = ContinuousClock.now
+            while window.attachedSheet != nil, ContinuousClock.now - start < .seconds(3) {
+                try? await Task.sleep(for: .milliseconds(30))
+            }
+            self?.presentSavePanel(options, for: window)
+        }
+    }
+
+    private func presentSavePanel(_ options: ExportOptions, for window: NSWindow) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [options.format.utType]
         panel.canCreateDirectories = true

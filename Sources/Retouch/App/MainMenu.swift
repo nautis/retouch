@@ -57,6 +57,7 @@ enum MainMenu {
         m.addItem(item("Close", #selector(NSWindow.performClose(_:)), "w"))
         m.addItem(item("Save", #selector(EditorWindowController.saveImage(_:)), "s"))
         m.addItem(item("Export As…", #selector(EditorWindowController.exportImage(_:)), "w", [.command, .option, .shift]))
+        m.addItem(item("Show Exported File in Finder", #selector(EditorWindowController.revealExport(_:)), "r", [.command, .shift]))
         return m
     }
 

@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import RetouchCore
 
 /// End-to-end check of the real app: `Retouch --selftest <outdir> <image>`.
@@ -27,6 +28,7 @@ enum SelfTest {
     private static func note(_ s: String) {
         log.append(s)
         print(s)
+        fflush(stdout) // the log is read while the test runs, or after it is killed
     }
 
     private static func check(_ ok: Bool, _ what: String) {
@@ -79,6 +81,25 @@ enum SelfTest {
     }
 
     // MARK: - Synthetic input
+
+    private static func pressSaveFromOutside() -> Bool {
+        let script = """
+        tell application "System Events" to tell process "Retouch"
+            set s to sheet 1 of window 1
+            click button "Save" of splitter group 1 of s
+        end tell
+        """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        let err = Pipe()
+        p.standardError = err
+        do { try p.run() } catch { note("osascript: \(error.localizedDescription)"); return false }
+        p.waitUntilExit()
+        let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if p.terminationStatus != 0 { note("osascript exit \(p.terminationStatus): \(msg)") }
+        return p.terminationStatus == 0
+    }
 
     private static func mouse(_ type: NSEvent.EventType, _ p: CGPoint, _ window: NSWindow) -> NSEvent? {
         NSEvent.mouseEvent(with: type, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
@@ -354,6 +375,38 @@ enum SelfTest {
         let smallSize = (try? ImageFiles.loadRaster(small)).map { ($0.width, $0.height) }
         check(smallSize.map { $0 == (800, 800) } ?? false,
               "Save kept the 800x800 export size (\(smallSize.map { "\($0.0)x\($0.1)" } ?? "none"))")
+
+        // The route a person takes: Export As… sheet, its Export… button, then the save sheet, then
+        // Save. Nothing above goes through the save panel. The panel suggests the last export's
+        // file (already in outDir); it is removed first so Save needs no replace confirmation.
+        try? FileManager.default.removeItem(at: small)
+        await m.autoAdjust(.tone)
+        m.dialog = .export
+        await wait("Export As sheet") { controller.dialogWindow != nil }
+        try? await Task.sleep(for: .milliseconds(300))
+        // Exactly what the sheet's Export… button does (ExportDialog.export): close the sheet, ask where.
+        m.dialog = nil
+        m.chooseDestinationAndExport(m.defaultExportOptions())
+        let panelShown = await settles(within: 10) { window.attachedSheet is NSSavePanel }
+        check(panelShown, "Export… opens the save sheet")
+        if let panel = window.attachedSheet as? NSSavePanel {
+            check(panel.nameFieldStringValue == small.lastPathComponent,
+                  "save sheet suggests the last export's name (got \(panel.nameFieldStringValue))")
+            check(panel.directoryURL?.standardizedFileURL == outDir.standardizedFileURL,
+                  "save sheet suggests the last export's folder (got \(panel.directoryURL?.path ?? "nil"))")
+            // -[NSSavePanel ok:] raises "not implemented" on macOS 27 and the panel's content is an
+            // NSRemoteView from the open-and-save service, so Save is pressed with a Return key.
+            // -[NSSavePanel ok:] raises "not implemented" on macOS 27, the panel's content is an
+            // NSRemoteView from the open-and-save service, and a synthetic Return goes nowhere while
+            // the app is not active. The accessibility tree bridges the remote view, so press Save there.
+            // the remote view's contents are not bridged for the process itself (the sheet shows one
+            // roleless child), so System Events presses it from outside.
+            check(pressSaveFromOutside(), "System Events pressed Save in the save sheet")
+        }
+        await wait("save sheet export", timeout: 30) { m.busyMessage == nil && window.attachedSheet == nil }
+        try? await Task.sleep(for: .milliseconds(300))
+        check(FileManager.default.fileExists(atPath: small.path), "Save in the save sheet writes \(small.lastPathComponent)")
+        check(!m.isDirty, "save sheet export clears the edited state")
 
         // Export… chosen in the close alert: the window closes by itself once the export lands
         m.closeAfterExport = true

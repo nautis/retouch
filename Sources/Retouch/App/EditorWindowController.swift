@@ -132,6 +132,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, NSMenu
 
     @objc func saveImage(_ sender: Any?) { model.save() }
     @objc func exportImage(_ sender: Any?) { model.dialog = .export }
+    @objc func revealExport(_ sender: Any?) {
+        guard let url = model.lastExport?.url else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
     @objc func undoEdit(_ sender: Any?) { Task { await model.undo() } }
     @objc func redoEdit(_ sender: Any?) { Task { await model.redo() } }
     @objc func autoTone(_ sender: Any?) { Task { await model.autoAdjust(.tone) } }
@@ -165,6 +169,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, NSMenu
         case #selector(redoEdit(_:)):
             menuItem.title = model.redoTitle
             return model.canRedo
+        case #selector(revealExport(_:)):
+            return model.lastExport != nil
         case #selector(cropToSelection(_:)):
             return model.canEdit && model.selection != nil
         case #selector(deselectPixels(_:)):
